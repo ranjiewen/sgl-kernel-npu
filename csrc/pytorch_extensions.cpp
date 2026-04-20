@@ -114,9 +114,10 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "Tensor? query_start_loc=None, bool activation_mode=False, int pad_slot_id=-1) -> Tensor");
 
     m.def(
-        "causal_conv1d(Tensor x, Tensor weight, Tensor conv_states, "
-        "Tensor query_start_loc, Tensor cache_indices, Tensor has_initial_state, "
-        "Tensor? bias=None, bool activation_mode=False, int pad_slot_id=-1) -> Tensor");
+        "causal_conv1d(Tensor x, Tensor weight, Tensor conv_state, "
+        "Tensor conv_state_indices, Tensor query_start_loc, Tensor? bias=None, "
+        "Tensor? num_accepted_tokens=None, Tensor? initial_state=None, "
+        "bool activation_mode=False, int pad_slot_id=-1, int run_mode=0) -> Tensor");
 }
 }  // namespace
 
@@ -180,13 +181,20 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
                                                                     query_loc_or_empty, activation_mode, pad_slot_id);
            });
 
-    m.impl("causal_conv1d", [](const at::Tensor &x, const at::Tensor &weight, const at::Tensor &conv_states,
-                               const at::Tensor &query_start_loc, const at::Tensor &cache_indices,
-                               const at::Tensor &has_initial_state, const c10::optional<at::Tensor> &bias,
-                               bool activation_mode, int64_t pad_slot_id) {
+    m.impl("causal_conv1d", [](const at::Tensor &x, const at::Tensor &weight, const at::Tensor &conv_state,
+                               const at::Tensor &conv_state_indices, const at::Tensor &query_start_loc,
+                               const c10::optional<at::Tensor> &bias,
+                               const c10::optional<at::Tensor> &num_accepted_tokens,
+                               const c10::optional<at::Tensor> &initial_state,
+                               bool activation_mode, int64_t pad_slot_id, int64_t run_mode) {
         auto bias_or_empty = bias.has_value() ? *bias : at::empty({0}, x.options());
-        return sglang::npu_kernel::causal_conv1d_impl(x, weight, conv_states, query_start_loc, cache_indices,
-                                                      has_initial_state, bias_or_empty, activation_mode, pad_slot_id);
+        auto num_accepted_or_empty =
+            num_accepted_tokens.has_value() ? *num_accepted_tokens : at::empty({0}, at::kLong);
+        auto initial_state_or_empty =
+            initial_state.has_value() ? *initial_state : at::empty({0}, at::kLong);
+        return sglang::npu_kernel::causal_conv1d_impl(x, weight, bias_or_empty, conv_state, conv_state_indices,
+                                                      query_start_loc, num_accepted_or_empty, initial_state_or_empty,
+                                                      activation_mode, pad_slot_id, run_mode);
     });
 }
 }  // namespace

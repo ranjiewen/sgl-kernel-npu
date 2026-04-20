@@ -1,8 +1,3 @@
-/*!
- * \file causal_conv1d_common.h
- * \brief Common utilities and constants for CausalConv1D prefill kernel.
- */
-
 #ifndef CAUSAL_CONV1D_COMMON_H
 #define CAUSAL_CONV1D_COMMON_H
 
@@ -27,6 +22,12 @@ __aicore__ inline int32_t SlotHist(int32_t t, int32_t i)
 __aicore__ inline int32_t SlotPrefetch(int32_t t)
 {
     return (t + 4) % RING_SLOTS;
+}
+
+__aicore__ inline int32_t RetreatRingSlot(int32_t slot, int32_t delta)
+{
+    int32_t prev = slot - delta;
+    return (prev >= 0) ? prev : (prev + RING_SLOTS);
 }
 
 }  // namespace NsCausalConv1dCommon

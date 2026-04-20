@@ -1,186 +1,251 @@
-#include "causal_conv1d.h"
-
-#include <algorithm>
-#include <cstddef>
-
+#include <cstdio>
+#include <cstring>
+#include <unordered_map>
+#include <functional>
 #include "acl/acl.h"
+#include "kernel_tiling/kernel_tiling.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "tiling/causal_conv1d_tiling.h"
-#include "causal_conv1d_tiling_data.h"
+#include "defines.h"
+#include "torch_helper.h"
+#include "common_tiling.h"
+#include "common.h"
 #include "stub/aclrtlaunch_causal_conv1d_bfloat16_t.h"
 #include "stub/aclrtlaunch_causal_conv1d_half.h"
-#include "torch_helper.h"
 
 namespace sglang {
 namespace npu_kernel {
-namespace {
 
 constexpr uint32_t PADDING_BYTE = 32U;
+constexpr uint32_t MAX_CAPTURE_NUM = 1024;
 
-struct CausalConv1dShapeInfo {
-    int64_t batch = 0;
-    int64_t cuSeqlen = 0;
-    int64_t seqLen = 0;
-    int64_t inputMode = 0;
-    int64_t dim = 0;
-    int64_t width = 0;
-    int64_t stateLen = 0;
-    int64_t numCacheLines = 0;
-    bool hasBias = false;
+uint32_t conv1dCaptureNum = 0;
+static std::unordered_map<uint64_t, uint32_t> conv1dCaptureMap;
+
+struct CausalConv1dTilingKey {
+    int64_t batch;
+    int64_t seqLen;
+    int64_t dim;
+    int64_t width;
+    int64_t stateLen;
+    int64_t hasIndices;
+    int64_t hasBias;
+    int64_t hasNumAccept;
+    int64_t hasQueryLoc;
+    int64_t hasInitState;
+    int64_t activationMode;
+    int64_t padSlotId;
+    int64_t runMode;
+
+    bool operator==(const CausalConv1dTilingKey &other) const
+    {
+        return batch == other.batch && seqLen == other.seqLen && dim == other.dim && width == other.width &&
+               stateLen == other.stateLen && hasIndices == other.hasIndices && hasBias == other.hasBias &&
+               hasNumAccept == other.hasNumAccept && hasQueryLoc == other.hasQueryLoc &&
+               hasInitState == other.hasInitState && activationMode == other.activationMode &&
+               padSlotId == other.padSlotId && runMode == other.runMode;
+    }
 };
 
-void CheckSameDevice(const at::Tensor &lhs, const at::Tensor &rhs, const char *lhs_name, const char *rhs_name)
-{
-    TORCH_CHECK(lhs.device() == rhs.device(), lhs_name, " and ", rhs_name, " must be on the same device");
-}
+struct CausalConv1dTilingKeyHash {
+    std::size_t operator()(const CausalConv1dTilingKey &k) const
+    {
+        std::size_t h1 = std::hash<int64_t>{}(k.batch);
+        std::size_t h2 = std::hash<int64_t>{}(k.seqLen);
+        std::size_t h3 = std::hash<int64_t>{}(k.dim);
+        std::size_t h4 = std::hash<int64_t>{}(k.width);
+        std::size_t h5 = std::hash<int64_t>{}(k.stateLen);
+        std::size_t h6 = std::hash<int64_t>{}(k.hasIndices);
+        std::size_t h7 = std::hash<int64_t>{}(k.hasBias);
+        std::size_t h8 = std::hash<int64_t>{}(k.hasNumAccept);
+        std::size_t h9 = std::hash<int64_t>{}(k.hasQueryLoc);
+        std::size_t h10 = std::hash<int64_t>{}(k.hasInitState);
+        std::size_t h11 = std::hash<int64_t>{}(k.activationMode);
+        std::size_t h12 = std::hash<int64_t>{}(k.padSlotId);
+        std::size_t h13 = std::hash<int64_t>{}(k.runMode);
+        return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5) ^ (h7 << 6) ^ (h8 << 7) ^ (h9 << 8) ^
+               (h10 << 9) ^ (h11 << 10) ^ (h12 << 11) ^ (h13 << 12);
+    }
+};
 
-CausalConv1dShapeInfo ValidateInputs(const at::Tensor &x, const at::Tensor &weight, const at::Tensor &conv_states,
-                                     const at::Tensor &query_start_loc, const at::Tensor &cache_indices,
-                                     const at::Tensor &has_initial_state, const at::Tensor &bias)
+HOST_API at::Tensor causal_conv1d_impl(const at::Tensor &x, const at::Tensor &weight,
+                                       const at::Tensor &bias, const at::Tensor &conv_state,
+                                       const at::Tensor &conv_state_indices, const at::Tensor &query_start_loc,
+                                       const at::Tensor &num_accepted_tokens, const at::Tensor &initial_state,
+                                       bool activation_mode, int64_t pad_slot_id, int64_t run_mode)
 {
     TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "x must be 2D [cu_seqlen, dim] or 3D [batch, seq_len, dim], got shape ",
                 x.sizes());
-    TORCH_CHECK(weight.dim() == 2, "weight must be 2D [width, dim], got shape ", weight.sizes());
-    TORCH_CHECK(conv_states.dim() == 3, "conv_states must be 3D [num_cache_lines, state_len, dim], got shape ",
-                conv_states.sizes());
-    TORCH_CHECK(query_start_loc.dim() == 1, "query_start_loc must be 1D [batch + 1], got shape ",
-                query_start_loc.sizes());
-    TORCH_CHECK(cache_indices.dim() == 1, "cache_indices must be 1D [batch], got shape ", cache_indices.sizes());
-    TORCH_CHECK(has_initial_state.dim() == 1, "has_initial_state must be 1D [batch], got shape ",
-                has_initial_state.sizes());
+    TORCH_CHECK(weight.dim() == 2, "weight must be 2D tensor [width, dim], got shape ", weight.sizes());
+    TORCH_CHECK(conv_state.dim() == 3, "conv_state must be 3D tensor [cache_len, state_len, dim], got shape ",
+                conv_state.sizes());
 
     const at::ScalarType dtype = x.scalar_type();
     TORCH_CHECK(dtype == at::kBFloat16 || dtype == at::kHalf, "Only BF16 and FP16 are supported, got ", dtype);
     TORCH_CHECK(weight.scalar_type() == dtype, "weight dtype must match x dtype");
-    TORCH_CHECK(conv_states.scalar_type() == dtype, "conv_states dtype must match x dtype");
-    TORCH_CHECK(query_start_loc.scalar_type() == at::kInt, "query_start_loc dtype must be int32");
-    TORCH_CHECK(cache_indices.scalar_type() == at::kInt, "cache_indices dtype must be int32");
-    TORCH_CHECK(has_initial_state.scalar_type() == at::kBool, "has_initial_state dtype must be bool");
+    TORCH_CHECK(conv_state.scalar_type() == dtype, "conv_state dtype must match x dtype");
 
-    const bool has_bias = bias.numel() > 0;
-    if (has_bias) {
-        TORCH_CHECK(bias.dim() == 1, "bias must be 1D [dim], got shape ", bias.sizes());
-        TORCH_CHECK(bias.scalar_type() == dtype, "bias dtype must match x dtype");
-    }
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous before entering the NPU kernel.");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous.");
+    TORCH_CHECK(conv_state.is_contiguous(), "conv_state must be contiguous.");
 
-    CheckSameDevice(x, weight, "x", "weight");
-    CheckSameDevice(x, conv_states, "x", "conv_states");
-    CheckSameDevice(x, query_start_loc, "x", "query_start_loc");
-    CheckSameDevice(x, cache_indices, "x", "cache_indices");
-    CheckSameDevice(x, has_initial_state, "x", "has_initial_state");
-    if (has_bias) {
-        CheckSameDevice(x, bias, "x", "bias");
-    }
+    const bool is_update_mode = (run_mode == CAUSAL_CONV1D_RUN_MODE_UPDATE);
+    const bool is_fn_mode = (run_mode == CAUSAL_CONV1D_RUN_MODE_FN);
 
-    TORCH_CHECK(x.is_contiguous(), "x must be contiguous before entering the NPU kernel");
-    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous before entering the NPU kernel");
-    TORCH_CHECK(conv_states.is_contiguous(), "conv_states must be contiguous before entering the NPU kernel");
-    TORCH_CHECK(query_start_loc.is_contiguous(), "query_start_loc must be contiguous before entering the NPU kernel");
-    TORCH_CHECK(cache_indices.is_contiguous(), "cache_indices must be contiguous before entering the NPU kernel");
-    TORCH_CHECK(has_initial_state.is_contiguous(),
-                "has_initial_state must be contiguous before entering the NPU kernel");
-    if (has_bias) {
-        TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous before entering the NPU kernel");
-    }
+    int64_t batch = 0;
+    int64_t seq_len = 0;
+    int64_t dim = 0;
+    int64_t cu_seqlen = 0;
+    int64_t input_mode = 0;
 
-    CausalConv1dShapeInfo info;
     if (x.dim() == 2) {
-        info.inputMode = 0;
-        info.cuSeqlen = x.size(0);
-        info.dim = x.size(1);
-        info.seqLen = 0;
-        TORCH_CHECK(info.dim > 0, "x.shape[1] must be > 0");
-        TORCH_CHECK(info.cuSeqlen >= 0, "x.shape[0] must be >= 0");
-        TORCH_CHECK(query_start_loc.size(0) >= 1, "query_start_loc.size(0) must be >= 1");
-        info.batch = query_start_loc.size(0) - 1;
+        if (is_update_mode) {
+            input_mode = 2;
+            batch = x.size(0);
+            dim = x.size(1);
+            seq_len = 1;
+            cu_seqlen = batch;
+        } else {
+            input_mode = 0;
+            cu_seqlen = x.size(0);
+            dim = x.size(1);
+            TORCH_CHECK(query_start_loc.numel() > 0, "query_start_loc is required for 2D input (varlen mode)");
+            batch = query_start_loc.size(0) - 1; // check ?
+        }
     } else {
-        info.inputMode = 1;
-        info.batch = x.size(0);
-        info.seqLen = x.size(1);
-        info.dim = x.size(2);
-        info.cuSeqlen = info.batch * info.seqLen;
-        TORCH_CHECK(info.batch > 0, "x.shape[0] must be > 0");
-        TORCH_CHECK(info.seqLen > 0, "x.shape[1] must be > 0");
-        TORCH_CHECK(info.dim > 0, "x.shape[2] must be > 0");
-        TORCH_CHECK(query_start_loc.size(0) == info.batch + 1,
-                    "query_start_loc.size(0) must equal batch + 1 for 3D input");
+        input_mode = 1;
+        batch = x.size(0);
+        seq_len = x.size(1);
+        dim = x.size(2);
+        cu_seqlen = batch * seq_len;
     }
 
-    TORCH_CHECK(info.batch > 0, "batch must be > 0");
+    const int64_t width = weight.size(0);
+    TORCH_CHECK(width >= 2 && width <= 4, "width must be in [2, 4], got ", width);
 
-    info.width = weight.size(0);
-    TORCH_CHECK(weight.size(1) == info.dim, "weight.shape[1] must equal dim");
-    TORCH_CHECK(info.width == 4, "Only width == 4 is supported, got ", info.width);
-    TORCH_CHECK(info.dim % 16 == 0, "dim must be multiple of 16 for fp16/bf16 alignment, but got ", info.dim);
+    const int64_t state_len = conv_state.size(1);
+    const int64_t num_cache_lines = conv_state.size(0);
 
-    info.numCacheLines = conv_states.size(0);
-    info.stateLen = conv_states.size(1);
-    TORCH_CHECK(info.numCacheLines > 0, "conv_states.shape[0] must be > 0");
-    TORCH_CHECK(conv_states.size(2) == info.dim, "conv_states.shape[2] must equal dim");
-    TORCH_CHECK(info.stateLen >= info.width - 1, "conv_states.shape[1] must be >= width - 1");
+    const bool has_indices = conv_state_indices.numel() > 0;
+    const bool has_bias = bias.numel() > 0;
+    const bool has_num_accept = num_accepted_tokens.numel() > 0;
+    const bool has_query_loc = query_start_loc.numel() > 0;
+    const bool has_initial_state = initial_state.numel() > 0;
 
-    TORCH_CHECK(cache_indices.size(0) == info.batch, "cache_indices.size(0) must equal batch");
-    TORCH_CHECK(has_initial_state.size(0) == info.batch, "has_initial_state.size(0) must equal batch");
-
-    if (has_bias) {
-        TORCH_CHECK(bias.size(0) == info.dim, "bias.size(0) must equal dim");
-    }
-
-    info.hasBias = has_bias;
-    return info;
-}
-
-}  // namespace
-
-HOST_API at::Tensor causal_conv1d_impl(const at::Tensor &x, const at::Tensor &weight, const at::Tensor &conv_states,
-                                       const at::Tensor &query_start_loc, const at::Tensor &cache_indices,
-                                       const at::Tensor &has_initial_state, const at::Tensor &bias,
-                                       bool activation_mode, int64_t pad_slot_id)
-{
-    const CausalConv1dShapeInfo info =
-        ValidateInputs(x, weight, conv_states, query_start_loc, cache_indices, has_initial_state, bias);
+    at::Tensor y = at::empty_like(x);
 
     auto ascendc_platform = platform_ascendc::PlatformAscendCManager::GetInstance();
     TORCH_CHECK(ascendc_platform != nullptr, "Failed to acquire AscendC platform manager");
 
-    const int32_t core_num = static_cast<int32_t>(ascendc_platform->GetCoreNumAiv());
-    TORCH_CHECK(core_num > 0, "AscendC returned invalid core_num: ", core_num);
+    uint64_t ubSize = 0;
+    ascendc_platform->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
+    int32_t max_aiv_core = static_cast<int32_t>(ascendc_platform->GetCoreNumAiv());
+    int32_t workspace_size = static_cast<int32_t>(ascendc_platform->GetLibApiWorkSpaceSize());
 
-    CausalConv1dTilingData tiling_data{};
-    SGLang::CausalConv1d::ComputeTilingData(info.batch, info.cuSeqlen, info.seqLen, info.inputMode, info.dim,
-                                            info.width, info.stateLen, info.numCacheLines, info.hasBias,
-                                            activation_mode, pad_slot_id, core_num, tiling_data);
+    const int64_t *qsl_data = has_query_loc ? query_start_loc.data_ptr<int64_t>() : nullptr;
+    SGLang::CausalConv1d::CausalConv1dTilingResult tiling_result =
+        SGLang::CausalConv1d::ComputeTilingDataWithSeqRanges(
+            batch, cu_seqlen, seq_len, input_mode, dim, width, state_len, num_cache_lines,
+            has_bias, activation_mode, pad_slot_id, run_mode,
+            has_num_accept, has_indices, has_initial_state,
+            ubSize, static_cast<uint32_t>(max_aiv_core), qsl_data);
+    CausalConv1dTilingData &tiling_data = tiling_result.tilingData;
 
-    TORCH_CHECK(tiling_data.dimTileSize > 0, "Failed to choose a valid dimTileSize for dim=", info.dim);
-    TORCH_CHECK(tiling_data.blocksPerSeq > 0, "Failed to choose a valid blocksPerSeq for dim=", info.dim);
+    printf("[CausalConv1d] Tiling: runMode=%ld, inputMode=%ld, batch=%ld, dim=%ld, width=%ld, "
+           "cuSeqlen=%ld, seqLen=%ld, stateLen=%ld, numCacheLines=%ld, "
+           "baseDim=%ld, baseDimCnt=%ld, "
+           "tokenBlockSize=%ld, tokenBlockCnt=%ld, "
+           "hasBias=%ld, hasCacheIndices=%ld, hasNumAcceptedTokens=%ld, hasInitialStateMode=%ld, "
+           "hasExplicitTokenSeqRanges=%ld, explicitTokenSeqRangeCount=%ld, "
+           "activationMode=%ld, padSlotId=%ld, effectiveGridSize=%ld, blockDim=%ld, ubSize=%lu, coreNum=%u\n",
+           tiling_data.runMode, tiling_data.inputMode, tiling_data.batch, tiling_data.dim, tiling_data.width,
+           tiling_data.cuSeqlen, tiling_data.seqLen, tiling_data.stateLen, tiling_data.numCacheLines,
+           tiling_data.baseDim, tiling_data.baseDimCnt,
+           tiling_data.tokenBlockSize, tiling_data.tokenBlockCnt,
+           tiling_data.hasBias, tiling_data.hasCacheIndices, tiling_data.hasNumAcceptedTokens, tiling_data.hasInitialStateMode,
+           tiling_data.hasExplicitTokenSeqRanges, tiling_data.explicitTokenSeqRangeCount,
+           tiling_data.activationMode, tiling_data.padSlotId,
+           tiling_result.effectiveGridSize, tiling_result.blockDim, ubSize, static_cast<uint32_t>(max_aiv_core));
 
-    const int64_t grid_size = info.batch * tiling_data.blocksPerSeq;
-    TORCH_CHECK(grid_size > 0, "Invalid grid_size computed for causal_conv1d: ", grid_size);
+    int32_t tilingSize = (sizeof(CausalConv1dTilingData) + PADDING_BYTE - 1) / PADDING_BYTE * PADDING_BYTE;
+    at::Tensor tilingTensor;
 
-    const int32_t block_dim = static_cast<int32_t>(std::min<int64_t>(grid_size, core_num));
-    const int64_t workspace_size = static_cast<int64_t>(ascendc_platform->GetLibApiWorkSpaceSize());
+    CausalConv1dTilingKey key{.batch = batch,
+                              .seqLen = seq_len,
+                              .dim = dim,
+                              .width = width,
+                              .stateLen = state_len,
+                              .hasIndices = has_indices ? 1 : 0,
+                              .hasBias = has_bias ? 1 : 0,
+                              .hasNumAccept = has_num_accept ? 1 : 0,
+                              .hasQueryLoc = has_query_loc ? 1 : 0,
+                              .hasInitState = has_initial_state ? 1 : 0,
+                              .activationMode = activation_mode ? 1 : 0,
+                              .padSlotId = pad_slot_id,
+                              .runMode = run_mode};
+    uint64_t hashValue = CausalConv1dTilingKeyHash{}(key);
 
-    const size_t tiling_bytes = sizeof(CausalConv1dTilingData);
-    const size_t aligned_tiling_bytes = (tiling_bytes + static_cast<size_t>(PADDING_BYTE) - 1U) /
-                                        static_cast<size_t>(PADDING_BYTE) * static_cast<size_t>(PADDING_BYTE);
+    auto copyTilingToDevice = [&]() {
+        auto cpuTiling = at::empty({tilingSize}, at::kByte);
+        std::memcpy(cpuTiling.data_ptr(), &tiling_data, sizeof(CausalConv1dTilingData));
+        return TorchNpuHelper::CopyTensorHostToDevice(cpuTiling);
+    };
 
-    auto byte_options = x.options().dtype(at::kByte);
-    at::Tensor tiling_tensor = at::empty({static_cast<int64_t>(aligned_tiling_bytes)}, byte_options);
-    const aclError copy_ret = aclrtMemcpy(tiling_tensor.data_ptr<uint8_t>(), aligned_tiling_bytes, &tiling_data,
-                                          tiling_bytes, ACL_MEMCPY_HOST_TO_DEVICE);
-    TORCH_CHECK(copy_ret == ACL_SUCCESS, "aclrtMemcpy for tiling data failed with code ", static_cast<int>(copy_ret));
+    static auto globalTilingBuffer = at::empty({tilingSize * MAX_CAPTURE_NUM},
+                                               at::TensorOptions().dtype(at::kByte).device(x.options().device()));
 
-    at::Tensor workspace_tensor = at::empty({workspace_size}, byte_options);
-    at::Tensor y = at::empty_like(x);
-
-    if (x.scalar_type() == at::kBFloat16) {
-        EXEC_KERNEL_CMD(causal_conv1d_bfloat16_t, block_dim, x, weight,
-                        info.hasBias ? bias : at::empty({0}, x.options()), conv_states, query_start_loc, cache_indices,
-                        has_initial_state, y, workspace_tensor, tiling_tensor);
+    if (conv1dCaptureMap.find(hashValue) != conv1dCaptureMap.end()) {
+        tilingTensor = at::from_blob(globalTilingBuffer.data_ptr<uint8_t>() + (tilingSize * conv1dCaptureMap[hashValue]),
+                                     tilingSize, at::kByte);
+    } else if (conv1dCaptureNum >= MAX_CAPTURE_NUM) {
+        tilingTensor = copyTilingToDevice();
     } else {
-        EXEC_KERNEL_CMD(causal_conv1d_half, block_dim, x, weight, info.hasBias ? bias : at::empty({0}, x.options()),
-                        conv_states, query_start_loc, cache_indices, has_initial_state, y, workspace_tensor,
-                        tiling_tensor);
+        conv1dCaptureMap[hashValue] = conv1dCaptureNum;
+        auto deviceTiling = copyTilingToDevice();
+        globalTilingBuffer.slice(0, conv1dCaptureNum * tilingSize, conv1dCaptureNum * tilingSize + tilingSize)
+            .copy_(deviceTiling);
+        conv1dCaptureNum++;
+        tilingTensor = at::from_blob(globalTilingBuffer.data_ptr<uint8_t>() + (tilingSize * conv1dCaptureMap[hashValue]),
+                                     tilingSize, at::kByte);
+    }
+
+    auto workspace_tensor =
+        at::empty({workspace_size}, at::TensorOptions().dtype(at::kByte).device(x.options().device()));
+
+    int32_t block_dim = static_cast<int32_t>(tiling_result.blockDim);
+    if (block_dim <= 0) {
+        block_dim = 1;
+    }
+
+    printf("[CausalConv1d] Dispatch: block_dim=%d, dtype=%d, has_bias=%d, has_indices=%d, "
+           "has_query_loc=%d, has_num_accept=%d, has_initial_state=%d\n",
+           block_dim, static_cast<int>(dtype), has_bias, has_indices,
+           has_query_loc, has_num_accept, has_initial_state);
+
+    at::Tensor empty_bias = at::empty(0, x.options());
+    at::Tensor empty_indices = at::empty(0, at::kLong);
+    at::Tensor empty_query_loc = at::empty(0, at::kLong);
+    at::Tensor empty_num_accept = at::empty(0, at::kLong);
+    at::Tensor empty_initial_state = at::empty(0, at::kLong);
+
+    if (dtype == at::kBFloat16) {
+        EXEC_KERNEL_CMD(causal_conv1d_bfloat16_t, block_dim, x, weight,
+                        has_bias ? bias : empty_bias,
+                        conv_state,
+                        has_indices ? conv_state_indices : empty_indices,
+                        has_query_loc ? query_start_loc : empty_query_loc,
+                        has_num_accept ? num_accepted_tokens : empty_num_accept,
+                        has_initial_state ? initial_state : empty_initial_state,
+                        y, workspace_tensor, tilingTensor);
+    } else {
+        EXEC_KERNEL_CMD(causal_conv1d_half, block_dim, x, weight,
+                        has_bias ? bias : empty_bias,
+                        conv_state,
+                        has_indices ? conv_state_indices : empty_indices,
+                        has_query_loc ? query_start_loc : empty_query_loc,
+                        has_num_accept ? num_accepted_tokens : empty_num_accept,
+                        has_initial_state ? initial_state : empty_initial_state,
+                        y, workspace_tensor, tilingTensor);
     }
 
     return y;
